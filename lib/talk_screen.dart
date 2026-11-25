@@ -164,7 +164,14 @@ class _TalkScreenState extends State<TalkScreen> {
       } catch (_) {}
       _status = 'Connected';
     } catch (e) {
-      _error = 'Could not connect: $e';
+      var hint = '';
+      if (e.toString().toLowerCase().contains('token')) {
+        hint = '\n\nThis usually means the API key and secret were copied '
+            'wrongly, belong to a different LiveKit project than this server '
+            'address, or the token has expired. Go back, check the token '
+            'details on the first screen, and make a new token.';
+      }
+      _error = 'Could not connect: $e$hint';
       _status = 'Not connected';
     }
     _refresh();

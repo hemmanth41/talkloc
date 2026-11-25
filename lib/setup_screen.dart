@@ -3,6 +3,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'talk_screen.dart';
 import 'theme.dart';
+import 'token_info.dart';
 
 /// First screen of the prototype. You paste the server address and the
 /// token made for THIS phone (see README). They are saved on the phone.
@@ -39,8 +40,9 @@ class _SetupScreenState extends State<SetupScreen> {
   }
 
   Future<void> _go() async {
-    final url = _url.text.trim();
-    final token = _token.text.trim();
+    // Remove spaces and line breaks that sneak in when copying.
+    final url = _url.text.replaceAll(RegExp(r'\s+'), '');
+    final token = _token.text.replaceAll(RegExp(r'\s+'), '');
     if (!(url.startsWith('wss://') || url.startsWith('ws://'))) {
       setState(() => _problem = 'The server address should start with wss://');
       return;
@@ -138,6 +140,7 @@ class _SetupScreenState extends State<SetupScreen> {
               controller: _token,
               minLines: 3,
               maxLines: 5,
+              onChanged: (_) => setState(() {}),
               autocorrect: false,
               enableSuggestions: false,
               decoration: InputDecoration(
@@ -148,6 +151,10 @@ class _SetupScreenState extends State<SetupScreen> {
                 ),
               ),
             ),
+            if (_token.text.trim().isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _TokenCheck(info: describeToken(_token.text)),
+            ],
             if (_problem != null) ...[
               const SizedBox(height: 12),
               Text(
@@ -183,6 +190,48 @@ class _SetupScreenState extends State<SetupScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Small box under the token field that says what the token contains.
+class _TokenCheck extends StatelessWidget {
+  const _TokenCheck({required this.info});
+
+  final TokenInfo info;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: info.looksOk ? AppColors.greenSoft : AppColors.amberSoft,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            info.looksOk ? 'Token looks fine' : 'Check this token',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: info.looksOk ? AppColors.green : AppColors.amberInk,
+            ),
+          ),
+          const SizedBox(height: 4),
+          for (final line in info.lines)
+            Text(
+              line,
+              style: const TextStyle(
+                fontSize: 12,
+                height: 1.4,
+                color: AppColors.ink,
+              ),
+            ),
+        ],
       ),
     );
   }
