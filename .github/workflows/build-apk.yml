@@ -1,0 +1,43 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create the Android project files
+        run: flutter create --org app.circles --project-name talkloc --platforms=android .
+
+      - name: Add permissions and settings the app needs
+        run: python3 scripts/patch_android.py
+
+      - name: Download packages
+        run: flutter pub get
+
+      - name: Build the APK
+        run: flutter build apk --release --no-shrink
+
+      - name: Keep the APK so you can download it
+        uses: actions/upload-artifact@v4
+        with:
+          name: talkloc-apk
+          path: build/app/outputs/flutter-apk/app-release.apk

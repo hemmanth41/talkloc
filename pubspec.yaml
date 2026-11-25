@@ -1,0 +1,20 @@
+name: talkloc
+description: Prototype - push-to-talk voice with live location on one screen.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  livekit_client: ^2.3.0
+  geolocator: ^13.0.1
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+  permission_handler: ^11.3.1
+  shared_preferences: ^2.3.2
+
+flutter:
+  uses-material-design: true

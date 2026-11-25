@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TalkLoc token maker</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #FBFAF7; color: #14201F; }
+  main { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 26px; margin: 0 0 8px; }
+  p { line-height: 1.5; color: #4B5B59; }
+  label { display: block; font-weight: 600; font-size: 14px; margin: 16px 0 6px; }
+  input { width: 100%; box-sizing: border-box; padding: 12px; font-size: 16px; border: 1.5px solid #CFCBC0; border-radius: 12px; background: #fff; }
+  button { margin-top: 20px; padding: 14px 20px; font-size: 16px; font-weight: 600; border: 0; border-radius: 14px; background: #C93A08; color: #fff; cursor: pointer; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 130px; padding: 12px; font-size: 13px; border: 1.5px solid #CFCBC0; border-radius: 12px; word-break: break-all; }
+  .note { background: #FFF4DD; color: #4A2F00; padding: 12px 14px; border-radius: 12px; font-size: 14px; line-height: 1.5; }
+  .err { color: #A52F06; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TalkLoc token maker</h1>
+  <p>Makes the pass (token) each phone needs to join the same room. Everything happens in this page on your computer. Nothing is sent anywhere.</p>
+  <div class="note">Keep the API secret private. Do not put it in GitHub, email or chat. Make one token per phone, with a different identity for each, and the same room name.</div>
+
+  <label for="key">LiveKit API key</label>
+  <input id="key" autocomplete="off" spellcheck="false">
+
+  <label for="secret">LiveKit API secret</label>
+  <input id="secret" type="password" autocomplete="off" spellcheck="false">
+
+  <label for="room">Room name (same for both phones)</label>
+  <input id="room" value="test-room" autocomplete="off">
+
+  <label for="identity">Identity for this phone (different for each phone, no spaces)</label>
+  <input id="identity" value="phone-1" autocomplete="off">
+
+  <label for="name">Name shown to the partner</label>
+  <input id="name" value="Me" autocomplete="off">
+
+  <label for="hours">Valid for (hours)</label>
+  <input id="hours" type="number" min="1" max="72" value="24">
+
+  <button id="make" type="button">Make token</button>
+  <p id="msg" class="err"></p>
+
+  <label for="out">Token (paste this into the app on that phone)</label>
+  <textarea id="out" readonly></textarea>
+  <button id="copy" type="button">Copy token</button>
+</main>
+
+<script>
+function b64url(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlText(text) {
+  return b64url(new TextEncoder().encode(text));
+}
+async function makeJwt(apiKey, apiSecret, room, identity, name, hours, nowSeconds) {
+  var now = nowSeconds || Math.floor(Date.now() / 1000);
+  var header = { alg: 'HS256', typ: 'JWT' };
+  var claims = {
+    iss: apiKey,
+    sub: identity,
+    name: name,
+    nbf: now - 10,
+    exp: now + Math.round(hours * 3600),
+    video: {
+      room: room,
+      roomJoin: true,
+      canPublish: true,
+      canSubscribe: true,
+      canPublishData: true
+    }
+  };
+  var signingInput = b64urlText(JSON.stringify(header)) + '.' + b64urlText(JSON.stringify(claims));
+  var key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(apiSecret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  var sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput));
+  return signingInput + '.' + b64url(new Uint8Array(sig));
+}
+
+if (typeof document !== 'undefined') {
+  var $ = function (id) { return document.getElementById(id); };
+  $('make').addEventListener('click', async function () {
+    $('msg').textContent = '';
+    $('out').value = '';
+    var key = $('key').value.trim();
+    var secret = $('secret').value.trim();
+    var room = $('room').value.trim();
+    var identity = $('identity').value.trim();
+    var name = $('name').value.trim() || identity;
+    var hours = parseFloat($('hours').value) || 24;
+    if (!key || !secret || !room || !identity) {
+      $('msg').textContent = 'Fill in the API key, API secret, room and identity.';
+      return;
+    }
+    if (!window.crypto || !crypto.subtle) {
+      $('msg').textContent = 'This browser cannot make tokens from a local file. Try the latest Chrome or Edge.';
+      return;
+    }
+    try {
+      $('out').value = await makeJwt(key, secret, room, identity, name, hours);
+    } catch (e) {
+      $('msg').textContent = 'Could not make the token: ' + e;
+    }
+  });
+  $('copy').addEventListener('click', async function () {
+    var text = $('out').value;
+    if (!text) return;
+    try { await navigator.clipboard.writeText(text); $('msg').textContent = ''; }
+    catch (e) { $('out').select(); document.execCommand('copy'); }
+  });
+}
+</script>
+</body>
+</html>
