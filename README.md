@@ -84,3 +84,12 @@ Write down what fails, with the phone model. That is the real result of this pro
 - `scripts/patch_android.py` adds permissions during the build
 - `tools/token-maker.html` makes the passes for each phone
 - `.github/workflows/build-apk.yml` the build recipe
+
+---
+
+## Version 2 notes (locked-screen and accuracy fixes)
+
+- **Keep sharing when the screen is off.** The app now asks your phone to let it run in the background. Choose **Allow**. On Xiaomi, Oppo, Vivo, Realme and Samsung phones also open the phone's app settings for TalkLoc and set battery to **No restrictions** and turn on **Autostart** or **Allow background activity**.
+- **Reconnect.** If the connection drops while the screen is off, the app now reconnects by itself, and restarts GPS if no update arrives for a minute.
+- **Pin accuracy.** The map now draws a circle around each pin showing how precise the GPS is. If the phone only has an approximate location, the app says so. In the phone's TalkLoc location permission, turn on **Use precise location**, and test outdoors with a clear sky.
+- **Diagnostics.** Tap the bug icon at the top of the map screen. It shows connection state, GPS updates, location sent, and a time-stamped log. After a locked-screen test, open it, tap **Copy**, and send it to me.

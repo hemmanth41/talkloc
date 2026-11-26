@@ -33,6 +33,9 @@ jobs:
       - name: Download packages
         run: flutter pub get
 
+      - name: Make the app icon
+        run: dart run flutter_launcher_icons
+
       - name: Build the APK
         run: flutter build apk --release --no-shrink
 

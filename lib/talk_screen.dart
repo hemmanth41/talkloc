@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart' hide ConnectionState;
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
@@ -33,55 +34,103 @@ class TalkScreen extends StatefulWidget {
   State<TalkScreen> createState() => _TalkScreenState();
 }
 
-class _TalkScreenState extends State<TalkScreen> {
-  final Room _room = Room(
-    roomOptions: RoomOptions(adaptiveStream: true, dynacast: true),
-  );
+class _TalkScreenState extends State<TalkScreen> with WidgetsBindingObserver {
+  late Room _room;
   EventsListener<RoomEvent>? _events;
   StreamSubscription<Position>? _posSub;
   Timer? _beat;
   Timer? _tick;
+  Timer? _watchdog;
   final MapController _map = MapController();
 
   Fix? _me;
   final Map<String, Fix> _others = <String, Fix>{};
   String _status = 'Starting...';
-  String? _error;
+  String? _connError;
+  String? _locError;
   bool _talking = false;
   bool _mapReady = false;
   bool _fitDone = false;
   bool _sharingLocation = false;
+  bool _leaving = false;
+  bool _connecting = false;
+  bool _connectedOnce = false;
+  bool _giveUp = false;
+
+  int _fixCount = 0;
+  int _sentCount = 0;
+  int _sendFails = 0;
+  int _reconnects = 0;
+  int _streamRestarts = 0;
+  DateTime? _lastFixAt;
+  DateTime? _lastSentAt;
+  AppLifecycleState _life = AppLifecycleState.resumed;
+  final List<String> _log = <String>[];
 
   @override
   void initState() {
     super.initState();
-    _room.addListener(_refresh);
+    WidgetsBinding.instance.addObserver(this);
+    _wireRoom();
     _tick = Timer.periodic(const Duration(seconds: 1), (_) => _refresh());
+    _watchdog = Timer.periodic(const Duration(seconds: 10), (_) => _watch());
     WidgetsBinding.instance.addPostFrameCallback((_) => _start());
   }
 
   @override
   void dispose() {
+    _leaving = true;
+    WidgetsBinding.instance.removeObserver(this);
     _tick?.cancel();
     _beat?.cancel();
+    _watchdog?.cancel();
     _posSub?.cancel();
     _events?.dispose();
     _room.removeListener(_refresh);
-    _room.disconnect().then((_) => _room.dispose());
+    _disposeRoom(_room);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _life = state;
+    _note('App is ${state.name}');
+    if (state == AppLifecycleState.resumed) {
+      _sendFix();
+      _watch();
+    }
   }
 
   void _refresh() {
     if (mounted) setState(() {});
   }
 
+  String _two(int n) => n.toString().padLeft(2, '0');
+
+  void _note(String message) {
+    final t = DateTime.now();
+    _log.add('${_two(t.hour)}:${_two(t.minute)}:${_two(t.second)}  $message');
+    if (_log.length > 120) _log.removeAt(0);
+  }
+
+  Future<void> _disposeRoom(Room room) async {
+    try {
+      await room.disconnect();
+    } catch (_) {}
+    try {
+      await room.dispose();
+    } catch (_) {}
+  }
+
   // ---------------------------------------------------------------- start
 
   Future<void> _start() async {
+    _note('Started');
     final agreed = await _showDisclosure();
     var locationOk = false;
     if (agreed) {
       locationOk = await _askPermissions();
+      await _askBackgroundRun();
     } else {
       await Permission.microphone.request();
     }
@@ -96,6 +145,7 @@ class _TalkScreenState extends State<TalkScreen> {
 
   /// Plain-words disclosure shown BEFORE the phone's own permission prompt.
   Future<bool> _showDisclosure() async {
+    if (!mounted) return false;
     final result = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
@@ -136,45 +186,144 @@ class _TalkScreenState extends State<TalkScreen> {
     return loc.isGranted;
   }
 
+  /// Asks the phone to let the app keep running when the screen is off.
+  Future<void> _askBackgroundRun() async {
+    if (!mounted) return;
+    try {
+      if (await Permission.ignoreBatteryOptimizations.isGranted) return;
+    } catch (_) {
+      return;
+    }
+    if (!mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Keep sharing when your screen is off'),
+        content: const Text(
+          'Next, your phone will ask if TalkLoc may run in the background. '
+          'Choose Allow. Without it, many phones stop sharing your location '
+          'a few minutes after the screen turns off.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Skip'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.orange),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+    if (go == true) {
+      try {
+        await Permission.ignoreBatteryOptimizations.request();
+      } catch (_) {}
+    }
+  }
+
   // ----------------------------------------------------------- voice + data
 
-  Future<void> _connect() async {
+  void _wireRoom() {
+    _room = Room(
+      roomOptions: RoomOptions(adaptiveStream: true, dynacast: true),
+    );
+    _room.addListener(_refresh);
     final events = _room.createListener();
     _events = events;
     events
       ..on<DataReceivedEvent>(_onData)
       ..on<ParticipantConnectedEvent>((e) {
+        _note('${e.participant.identity} joined');
         _sendFix();
         _refresh();
       })
       ..on<ParticipantDisconnectedEvent>((e) {
         _others.remove(e.participant.identity);
+        _note('${e.participant.identity} left');
+        _refresh();
+      })
+      ..on<RoomReconnectingEvent>((e) {
+        _note('Connection weak, reconnecting');
+        _refresh();
+      })
+      ..on<RoomReconnectedEvent>((e) {
+        _note('Reconnected');
+        _sendFix();
         _refresh();
       })
       ..on<RoomDisconnectedEvent>((e) {
+        _note('Disconnected from the server');
         _status = 'Disconnected';
         _refresh();
       })
       ..on<ActiveSpeakersChangedEvent>((e) => _refresh());
+  }
 
+  Future<void> _connect() async {
+    if (_connecting || _leaving) return;
+    _connecting = true;
     try {
       await _room.connect(widget.url, widget.token);
       try {
         await Hardware.instance.setSpeakerphoneOn(true);
       } catch (_) {}
       _status = 'Connected';
+      _connError = null;
+      _connectedOnce = true;
+      _note('Connected to the room');
+      _sendFix();
     } catch (e) {
+      final text = e.toString();
       var hint = '';
-      if (e.toString().toLowerCase().contains('token')) {
+      if (text.toLowerCase().contains('token')) {
         hint = '\n\nThis usually means the API key and secret were copied '
             'wrongly, belong to a different LiveKit project than this server '
             'address, or the token has expired. Go back, check the token '
             'details on the first screen, and make a new token.';
+        _giveUp = true;
       }
-      _error = 'Could not connect: $e$hint';
+      _connError = 'Could not connect: $text$hint';
       _status = 'Not connected';
+      _note('Connect failed: $text');
+    } finally {
+      _connecting = false;
     }
     _refresh();
+  }
+
+  /// Starts again with a fresh connection after the old one dropped.
+  Future<void> _rebuildAndConnect() async {
+    final old = _room;
+    _events?.dispose();
+    old.removeListener(_refresh);
+    _wireRoom();
+    _disposeRoom(old);
+    await _connect();
+  }
+
+  void _watch() {
+    if (_leaving) return;
+    if (_connectedOnce &&
+        !_giveUp &&
+        !_connecting &&
+        _room.connectionState == ConnectionState.disconnected) {
+      _reconnects++;
+      _note('Lost connection, reconnecting (try $_reconnects)');
+      _rebuildAndConnect();
+    }
+    final last = _lastFixAt;
+    if (_sharingLocation &&
+        last != null &&
+        DateTime.now().difference(last).inSeconds > 60) {
+      _streamRestarts++;
+      _note('No GPS update for 60 s, restarting location');
+      _lastFixAt = DateTime.now();
+      _startLocation();
+    }
   }
 
   void _onData(DataReceivedEvent e) {
@@ -211,7 +360,12 @@ class _TalkScreenState extends State<TalkScreen> {
         reliable: false,
         topic: 'loc',
       );
-    } catch (_) {}
+      _sentCount++;
+      _lastSentAt = DateTime.now();
+    } catch (e) {
+      _sendFails++;
+      if (_sendFails <= 3) _note('Sending location failed: $e');
+    }
   }
 
   Future<void> _talk(bool on) async {
@@ -220,7 +374,7 @@ class _TalkScreenState extends State<TalkScreen> {
     try {
       await _room.localParticipant?.setMicrophoneEnabled(on);
     } catch (e) {
-      _error = 'Microphone problem: $e';
+      _connError = 'Microphone problem: $e';
     }
     _refresh();
   }
@@ -229,13 +383,15 @@ class _TalkScreenState extends State<TalkScreen> {
 
   Future<void> _startLocation() async {
     if (!await Geolocator.isLocationServiceEnabled()) {
-      _error = 'Turn on location (GPS) in your phone settings.';
+      _locError = 'Turn on location (GPS) in your phone settings.';
+      _note('Location service is off');
       _refresh();
       return;
     }
+    await _posSub?.cancel();
     final settings = AndroidSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 3,
+      accuracy: LocationAccuracy.best,
+      distanceFilter: 0,
       intervalDuration: const Duration(seconds: 4),
       foregroundNotificationConfig: const ForegroundNotificationConfig(
         notificationTitle: 'TalkLoc is sharing your location',
@@ -247,17 +403,31 @@ class _TalkScreenState extends State<TalkScreen> {
     _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
       _onPosition,
       onError: (Object e) {
-        _error = 'Location problem: $e';
+        _locError = 'Location problem: $e';
+        _note('Location error: $e');
         _refresh();
       },
     );
     _sharingLocation = true;
+    _note('Location sharing started');
     // Send a position every 5 s even when standing still.
+    _beat?.cancel();
     _beat = Timer.periodic(const Duration(seconds: 5), (_) => _sendFix());
     _refresh();
   }
 
   void _onPosition(Position p) {
+    _fixCount++;
+    _lastFixAt = DateTime.now();
+    _locError = null;
+    final prev = _me;
+    // Keep a better recent fix instead of jumping to a poor one.
+    if (prev != null &&
+        p.accuracy > 150 &&
+        prev.accuracy < p.accuracy &&
+        DateTime.now().difference(prev.at).inSeconds < 20) {
+      return;
+    }
     _me = Fix(p.latitude, p.longitude, p.accuracy, DateTime.now());
     _sendFix();
     _fit(onlyOnce: true);
@@ -279,13 +449,101 @@ class _TalkScreenState extends State<TalkScreen> {
         _map.fitCamera(
           CameraFit.coordinates(
             coordinates: points,
-            padding: const EdgeInsets.fromLTRB(60, 120, 60, 340),
+            padding: const EdgeInsets.fromLTRB(60, 120, 60, 380),
             maxZoom: 17,
           ),
         );
         _fitDone = true;
       }
     } catch (_) {}
+  }
+
+  // ------------------------------------------------------------ diagnostics
+
+  String _diagnosticsText() {
+    String ago(DateTime? t) =>
+        t == null ? 'never' : '${DateTime.now().difference(t).inSeconds} s ago';
+    final b = StringBuffer()
+      ..writeln('Connection: ${_room.connectionState.name}')
+      ..writeln('App state: ${_life.name}')
+      ..writeln('GPS updates: $_fixCount (last ${ago(_lastFixAt)})')
+      ..writeln(
+        'Location sent: $_sentCount (last ${ago(_lastSentAt)}), '
+        'failed $_sendFails',
+      )
+      ..writeln('Reconnects: $_reconnects, GPS restarts: $_streamRestarts')
+      ..writeln(
+        'My GPS accuracy: '
+        '${_me == null ? 'none yet' : '+/- ${_me!.accuracy.round()} m'}',
+      )
+      ..writeln('--- log ---');
+    for (final line in _log) {
+      b.writeln(line);
+    }
+    return b.toString();
+  }
+
+  void _showDiagnostics() {
+    final text = _diagnosticsText();
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Diagnostics',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(ctx).size.height * 0.55,
+                ),
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    text,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'monospace',
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.orange,
+                      ),
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: text));
+                        Navigator.of(ctx).pop();
+                      },
+                      child: const Text('Copy'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => openAppSettings(),
+                      child: const Text('App settings'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   // ------------------------------------------------------------------ build
@@ -303,7 +561,9 @@ class _TalkScreenState extends State<TalkScreen> {
     final parts = name.trim().split(RegExp(r'\s+'));
     if (parts.isEmpty || parts.first.isEmpty) return '?';
     if (parts.length == 1) {
-      return parts.first.substring(0, parts.first.length.clamp(1, 2)).toUpperCase();
+      return parts.first
+          .substring(0, parts.first.length.clamp(1, 2))
+          .toUpperCase();
     }
     return (parts.first[0] + parts.last[0]).toUpperCase();
   }
@@ -379,6 +639,45 @@ class _TalkScreenState extends State<TalkScreen> {
     );
   }
 
+  Widget _banner(String text, {String? actionLabel, VoidCallback? onAction}) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.amberSoft,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            text,
+            style: const TextStyle(
+              fontSize: 13,
+              height: 1.35,
+              color: AppColors.amberInk,
+            ),
+          ),
+          if (actionLabel != null && onAction != null)
+            TextButton(
+              style: TextButton.styleFrom(
+                padding: EdgeInsets.zero,
+                minimumSize: const Size(0, 36),
+                alignment: Alignment.centerLeft,
+                foregroundColor: AppColors.amberInk,
+              ),
+              onPressed: onAction,
+              child: Text(
+                actionLabel,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final me = _me;
@@ -425,6 +724,33 @@ class _TalkScreenState extends State<TalkScreen> {
     if (_talking) statusLine = 'You are talking';
     if (partnerSpeaking) statusLine = '$partnerName is talking...';
 
+    final gpsLine = me == null
+        ? (_sharingLocation ? 'Finding your GPS...' : '')
+        : 'Your GPS: +/- ${me.accuracy.round()} m'
+            '${other != null ? '  |  Partner: +/- ${other.accuracy.round()} m' : ''}';
+
+    final circles = <CircleMarker>[
+      if (me != null && me.accuracy > 8)
+        CircleMarker(
+          point: me.point,
+          radius: me.accuracy.clamp(5, 800).toDouble(),
+          useRadiusInMeter: true,
+          color: const Color(0x1FC93A08),
+          borderColor: const Color(0x66C93A08),
+          borderStrokeWidth: 1,
+        ),
+      for (final f in _others.values)
+        if (f.accuracy > 8)
+          CircleMarker(
+            point: f.point,
+            radius: f.accuracy.clamp(5, 800).toDouble(),
+            useRadiusInMeter: true,
+            color: const Color(0x1F0B6B5D),
+            borderColor: const Color(0x660B6B5D),
+            borderStrokeWidth: 1,
+          ),
+    ];
+
     final markers = <Marker>[
       if (me != null)
         Marker(
@@ -469,6 +795,9 @@ class _TalkScreenState extends State<TalkScreen> {
         ),
     ];
 
+    final double? lowAccuracy =
+        (me != null && me.accuracy > 100) ? me.accuracy : null;
+
     return Scaffold(
       body: Stack(
         children: [
@@ -488,6 +817,7 @@ class _TalkScreenState extends State<TalkScreen> {
                   urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                   userAgentPackageName: 'app.circles.talkloc',
                 ),
+                CircleLayer(circles: circles),
                 MarkerLayer(markers: markers),
                 RichAttributionWidget(
                   attributions: [
@@ -545,7 +875,13 @@ class _TalkScreenState extends State<TalkScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: 8),
+                  _circleButton(
+                    Icons.bug_report_outlined,
+                    'Diagnostics',
+                    _showDiagnostics,
+                  ),
+                  const SizedBox(width: 8),
                   _circleButton(Icons.center_focus_strong, 'Show both', () {
                     _fit();
                   }),
@@ -572,22 +908,16 @@ class _TalkScreenState extends State<TalkScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (_error != null)
-                    Container(
-                      width: double.infinity,
-                      margin: const EdgeInsets.only(bottom: 12),
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: AppColors.amberSoft,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        _error!,
-                        style: const TextStyle(
-                          fontSize: 13,
-                          color: AppColors.amberInk,
-                        ),
-                      ),
+                  if (_connError != null) _banner(_connError!),
+                  if (_locError != null) _banner(_locError!),
+                  if (lowAccuracy != null)
+                    _banner(
+                      'Your GPS is only accurate to about '
+                      '${lowAccuracy.round()} m, so your pin may be off. '
+                      'Go outdoors for a clear sky view, and in the app '
+                      'settings turn on "Use precise location".',
+                      actionLabel: 'Open app settings',
+                      onAction: () => openAppSettings(),
                     ),
                   Align(
                     alignment: Alignment.centerLeft,
@@ -600,6 +930,20 @@ class _TalkScreenState extends State<TalkScreen> {
                       ),
                     ),
                   ),
+                  if (gpsLine.isNotEmpty)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Text(
+                          gpsLine,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: AppColors.muted,
+                          ),
+                        ),
+                      ),
+                    ),
                   const SizedBox(height: 12),
                   Row(
                     children: [
